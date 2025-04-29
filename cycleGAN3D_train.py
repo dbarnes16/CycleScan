@@ -332,6 +332,29 @@ def identity_loss(real_image, same_image):
     loss= tf.reduce_mean(tf.abs(real_image - same_image))
     return LAMBDA * 0.5 * loss
 
+def kl_divergence_histogram(real_img, generated_img, num_bins=256):
+    """
+    Computes KL divergence between voxel intensity histograms of two 3D volumes.
+    Inputs are assumed to be in [-1, 1], and will be rescaled to [0, 1].
+    """
+    # Flatten and rescale from [-1, 1] -> [0, 1]
+    real_flat = tf.reshape((real_img + 1.0) / 2.0, [-1])
+    gen_flat = tf.reshape((generated_img + 1.0) / 2.0, [-1])
+
+    # Compute histograms
+    hist_real = tf.histogram_fixed_width(real_flat, [0.0, 1.0], nbins=num_bins)
+    hist_gen = tf.histogram_fixed_width(gen_flat, [0.0, 1.0], nbins=num_bins)
+
+    # Normalize to get probability distributions
+    p = tf.cast(hist_real, tf.float32) / tf.reduce_sum(hist_real)
+    q = tf.cast(hist_gen, tf.float32) / tf.reduce_sum(hist_gen)
+
+    # Add epsilon to avoid log(0)
+    epsilon = 1e-10
+    kl_div = tf.reduce_sum(p * tf.math.log((p + epsilon) / (q + epsilon)))
+
+    return kl_div
+
 generator_g_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
 generator_f_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
 
@@ -414,6 +437,10 @@ def train_step(real_x, real_y):
         disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
         disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
 
+        kl_hist_x = kl_divergence_histogram(real_x, fake_x)
+        kl_hist_y = kl_divergence_histogram(real_y, fake_y)
+
+
     # Calculate the gradients for generator and discriminators 
     generator_g_gradients = tape.gradient(total_gen_g_loss, generator_g.trainable_variables)
     generator_f_gradients = tape.gradient(total_gen_f_loss, generator_f.trainable_variables)
@@ -429,7 +456,46 @@ def train_step(real_x, real_y):
     discriminator_x_optimizer.apply_gradients(zip(discriminator_x_gradients, discriminator_x.trainable_variables))
     discriminator_y_optimizer.apply_gradients(zip(discriminator_y_gradients, discriminator_y.trainable_variables))
     
-    return total_gen_g_loss, total_gen_f_loss, total_cycle_loss, disc_x_loss, disc_y_loss
+    return total_gen_g_loss, total_gen_f_loss, total_cycle_loss, disc_x_loss, disc_y_loss, kl_hist_x, kl_hist_y
+### VALIDATION FUNCTION ### 
+@tf.function
+def validation_step(real_x, real_y):
+    # Generator G translates A -> B (X -> Y)
+    # Generator F translates B -> A ( Y -> X)
+
+    fake_y = generator_g(real_x, training = False)
+    cycled_x = generator_f(fake_y, training = False)
+
+    fake_x = generator_f(real_y, training = False)
+    cycled_y = generator_g(fake_x, training = False)
+
+    # same_x and same_y are used for identity loss 
+    same_x = generator_f(real_x, training=False)
+    same_y = generator_g(real_y, training = False)
+
+    disc_real_x = discriminator_x(real_x, training = False)
+    disc_real_y = discriminator_y(real_y, training = False)
+
+    disc_fake_x = discriminator_x(fake_x, training=False)
+    disc_fake_y = discriminator_y(fake_y, training = True)
+
+    #calculate loss 
+    gen_g_loss = generator_loss(disc_fake_y)
+    gen_f_loss = generator_loss(disc_fake_x)
+
+    total_cycle_loss = calc_cycle_loss(real_x, cycled_x) + calc_cycle_loss(real_y, cycled_y)
+
+    # Total generator loss = adversarial loss + cycle loss
+    total_gen_g_loss = gen_g_loss + total_cycle_loss + identity_loss(real_y, same_y)
+    total_gen_f_loss = gen_f_loss + total_cycle_loss + identity_loss(real_x, same_x)
+
+    disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
+    disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
+
+    kl_hist_x = kl_divergence_histogram(real_x, fake_x)
+    kl_hist_y = kl_divergence_histogram(real_y, fake_y)
+
+    return total_gen_g_loss, total_gen_f_loss, total_cycle_loss, disc_x_loss, disc_y_loss, kl_hist_x, kl_hist_y
 
 #### LOAD DATA #### 
 base_path = 'data'
@@ -448,19 +514,90 @@ sample_ciss = next(iter(c_train))
 sample_dess = next(iter(d_train))
 
 print(sample_dess.shape)
+history = {
+    "gen_g_train": [],
+    "gen_f_train": [],
+    "cycle_train": [],
+    "disc_x_train": [],
+    "disc_y_train": [],
+    "kl_ciss_train": [],
+    "kl_dess_train": [],
+    
+    "gen_g_val": [],
+    "gen_f_val": [],
+    "cycle_val": [],
+    "disc_x_val": [],
+    "disc_y_val": [],
+    "kl_ciss_val": [],
+    "kl_dess_val": []
+}
+
 
 BATCH_SIZE = 1
 for epoch in range(EPOCHS):
-    for real_ciss, real_dess in tf.data.Dataset.zip((ciss_train.batch(BATCH_SIZE), dess_train.batch(BATCH_SIZE))): 
-        # add a batch from the training sets 
-        
-        gen_g_loss, gen_f_loss, cycle_loss, disc_x_loss, disc_y_loss = train_step(real_ciss, real_dess)
-        
-    print(f"Epoch [{epoch+1}/{EPOCHS}] - gen_g_loss: {gen_g_loss:.4f}, gen_f_loss:{gen_f_loss:.4f},cycle_loss:{cycle_loss:.4f}, disc_x_loss:{disc_x_loss:.4f}, disc_y_loss:{disc_y_loss:.4f}")
-    
-    if (epoch + 1) % 10==0:
-        ckpt_manager.save()
-        
+    train_losses = {"gen_g": 0.0, "gen_f": 0.0, "cycle": 0.0, "disc_x": 0.0, "disc_y": 0.0, "kl_ciss": 0.0, "kl_dess":0.0}
+    val_losses = {"gen_g": 0.0, "gen_f": 0.0, "cycle": 0.0, "disc_x": 0.0, "disc_y": 0.0, "kl_ciss": 0.0, "kl_dess":0.0}
+    n_train = n_val = 0
+
+    # Training loop
+    for real_ciss_train, real_dess_train in tf.data.Dataset.zip((ciss_train.batch(BATCH_SIZE), dess_train.batch(BATCH_SIZE))): 
+        gen_g_loss, gen_f_loss, cycle_loss, disc_x_loss, disc_y_loss, train_kl_ciss, train_kl_dess = train_step(real_ciss_train, real_dess_train)
+        train_losses["gen_g"] += gen_g_loss.numpy()
+        train_losses["gen_f"] += gen_f_loss.numpy()
+        train_losses["cycle"] += cycle_loss.numpy()
+        train_losses["disc_x"] += disc_x_loss.numpy()
+        train_losses["disc_y"] += disc_y_loss.numpy()
+        train_losses["kl_ciss"] += train_kl_ciss.numpy()
+        train_losses["kl_dess"] += train_kl_dess.numpy()
+        n_train += 1
+
+    # Validation loop
+    for real_ciss_val, real_dess_val in tf.data.Dataset.zip((ciss_val.batch(BATCH_SIZE), dess_val.batch(BATCH_SIZE))): 
+        val_gen_g_loss, val_gen_f_loss, val_cycle_loss, val_disc_x_loss, val_disc_y_loss,val_kl_ciss,val_kl_dess = validation_step(real_ciss_val, real_dess_val)
+        val_losses["gen_g"] += val_gen_g_loss.numpy()
+        val_losses["gen_f"] += val_gen_f_loss.numpy()
+        val_losses["cycle"] += val_cycle_loss.numpy()
+        val_losses["disc_x"] += val_disc_x_loss.numpy()
+        val_losses["disc_y"] += val_disc_y_loss.numpy()
+        val_losses["kl_ciss"] += val_kl_ciss.numpy()
+        val_losses["kl_dess"] += val_kl_dess.numpy()
+        n_val += 1
+
+    # Store average losses
+    for key in train_losses:
+        history[f"{key}_train"].append(train_losses[key] / n_train)
+        history[f"{key}_val"].append(val_losses[key] / n_val)
+
+    # Print summary
+    print(f"Epoch [{epoch+1}/{EPOCHS}]")
+    print(f"  Train - gen_g: {history['gen_g_train'][-1]:.4f}, gen_f: {history['gen_f_train'][-1]:.4f}, cycle: {history['cycle_train'][-1]:.4f}, disc_x: {history['disc_x_train'][-1]:.4f}, disc_y: {history['disc_y_train'][-1]:.4f}")
+    print(f"  Val   - gen_g: {history['gen_g_val'][-1]:.4f}, gen_f: {history['gen_f_val'][-1]:.4f}, cycle: {history['cycle_val'][-1]:.4f}, disc_x: {history['disc_x_val'][-1]:.4f}, disc_y: {history['disc_y_val'][-1]:.4f}")
+
+    # Generate images and save checkpoints periodically
     if (epoch + 1) % 10 == 0:
         generate_images(generator_g, sample_ciss.batch(BATCH_SIZE))
         generate_images(generator_f, sample_dess.batch(BATCH_SIZE))
+        ckpt_manager.save()
+
+# PLOTS 
+def plot_loss(history, loss_name):
+    plt.figure(figsize=(10, 5))
+    plt.plot(history[f"{loss_name}_train"], label=f"{loss_name} train")
+    plt.plot(history[f"{loss_name}_val"], label=f"{loss_name} val")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"{loss_name} Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    # Save the plot as a PNG file
+    plot_filename = f"LossPlots/{loss_name}Loss.png"
+    plt.savefig(plot_filename)
+
+plot_loss(history, "gen_g")
+plot_loss(history, "gen_f")
+plot_loss(history, "cycle")
+plot_loss(history, "disc_x")
+plot_loss(history, "disc_y")
+plot_loss(history, "kl_ciss")
+plot_loss(history, "kl_dess")
